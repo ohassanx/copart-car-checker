@@ -100,60 +100,84 @@ def fetch_copart_cars() -> Dict:
     """
     Fetch current Category U car listings from Copart
 
-    Note: Copart uses client-side rendering, so this attempts to query their API.
-    If this doesn't work, we may need to use Selenium or puppeteer.
+    Uses the actual Copart public vehicleFinder API endpoint
     """
-    # Try to find Copart's API endpoint
-    # Common patterns: /api/lots/search, /vehiclefinder/search, etc.
-
-    # Attempt 1: Try their search API
-    api_url = "https://www.copart.co.uk/public/data/search/solr"
+    api_url = "https://www.copart.co.uk/public/vehicleFinder/search"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Host": "www.copart.co.uk",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Connection": "keep-alive",
+        "Referer": "https://www.copart.co.uk/lotSearchResults",
+        "Cache-Control": "max-age=0"
     }
 
-    # Build search query - All cars, Category U only
-    search_data = {
-        "query": {
-            "bool": {
-                "must": [
-                    {"term": {"sale_title_type": "U"}},  # Category U only
-                    {"range": {"lot_year": {"gte": 2020, "lte": 2027}}},
-                    {"exists": {"field": "v5_document_number"}},
-                    {"term": {"transmission_type": "Automatic"}},
-                    {"range": {"odometer_reading_received": {"gte": 0, "lte": 80000}}}
-                ],
-                "should": [
-                    {"term": {"damage_type_code": "DAMAGECODE_MN"}},
-                    {"term": {"damage_type_code": "DAMAGECODE_NO"}}
-                ]
-            }
+    # Build search payload in DataTables format
+    # Filter for Category U, Year 2020-2027, Has V5, Automatic, Minor/No damage, 0-80k miles
+    misc_filter = "#TITL:sale_title_type:U #LotYear:[2020 TO 2027] #V5:v5_document_number:* #TMTP:transmission_type:Automatic (#PRID:damage_type_code:DAMAGECODE_MN OR #PRID:damage_type_code:DAMAGECODE_NO) #ODM:odometer_reading:[0 TO 80000]"
+
+    payload = {
+        "draw": "1",
+        "start": "0",
+        "length": "100",  # Get up to 100 results
+        "page": "1",
+        "size": "100",
+        "query": "*",
+        "sort": "auction_date_type desc,auction_date_utc asc",
+        "filter": {
+            "MISC": misc_filter
         }
     }
 
     try:
-        print(f"Attempting to fetch from Copart API...")
-        response = requests.post(api_url, json=search_data, headers=headers, timeout=15)
+        print(f"Attempting to fetch from Copart UK API...")
+        print(f"URL: {api_url}")
+
+        # Convert payload to form-urlencoded format
+        import urllib.parse
+        form_data = {
+            "draw": payload["draw"],
+            "start": payload["start"],
+            "length": payload["length"],
+            "page": payload["page"],
+            "size": payload["size"],
+            "query": payload["query"],
+            "sort": payload["sort"],
+            "filter[MISC]": misc_filter
+        }
+
+        response = requests.post(api_url, data=form_data, headers=headers, timeout=20)
+
+        print(f"Status: {response.status_code}")
 
         if response.status_code == 200:
-            return response.json()
+            try:
+                data = response.json()
+                print(f"✓ Success! Got response from Copart API")
+
+                # Extract result summary
+                total = data.get("data", {}).get("results", {}).get("totalElements", 0)
+                print(f"Total matching cars: {total}")
+
+                return data
+            except json.JSONDecodeError:
+                print(f"Response is not valid JSON")
+                print(f"Response preview: {response.text[:500]}")
+                return {"cars": [], "total": 0, "error": "Invalid JSON response"}
         else:
-            print(f"API returned status {response.status_code}")
-            print(f"Response: {response.text[:500]}")
-
-            # Fallback: Try GET request to search page
-            print("\nAttempting fallback method...")
-            response = requests.get(SEARCH_URL, params=SEARCH_PARAMS, headers=headers, timeout=15)
-            print(f"Fallback status: {response.status_code}")
-
-            # For now, return empty result - we'll need to enhance this
-            return {"cars": [], "total": 0, "method": "fallback"}
+            print(f"API request failed with status {response.status_code}")
+            print(f"Response preview: {response.text[:500]}")
+            return {"cars": [], "total": 0, "error": f"HTTP {response.status_code}"}
 
     except Exception as e:
         print(f"Error fetching from Copart: {e}")
+        import traceback
+        traceback.print_exc()
         return {"cars": [], "total": 0, "error": str(e)}
 
 
@@ -161,8 +185,19 @@ def extract_car_ids(data: Dict) -> Set[str]:
     """Extract car/lot IDs from Copart response"""
     car_ids = set()
 
-    # Try different response structures
-    if "lots" in data:
+    # Handle Copart vehicleFinder API response structure
+    if "data" in data and "results" in data["data"]:
+        results_data = data["data"]["results"]
+
+        # Check if it has content list
+        if "content" in results_data:
+            for lot in results_data["content"]:
+                # Use lotNumberStr or ln as the lot ID
+                lot_id = str(lot.get("lotNumberStr", lot.get("ln", "")))
+                if lot_id:
+                    car_ids.add(lot_id)
+    # Fallback: Try different response structures
+    elif "lots" in data:
         for lot in data["lots"]:
             car_ids.add(str(lot.get("lotNumberStr", lot.get("ln", ""))))
     elif "results" in data:
@@ -209,7 +244,13 @@ def main():
     # Fetch current listings
     data = fetch_copart_cars()
     current_cars = extract_car_ids(data)
-    total_count = data.get("total", len(current_cars))
+
+    # Get total count from response
+    total_count = 0
+    if "data" in data and "results" in data["data"]:
+        total_count = data["data"]["results"].get("totalElements", len(current_cars))
+    else:
+        total_count = data.get("total", len(current_cars))
 
     print(f"Current cars found: {len(current_cars)}")
     print(f"Total count: {total_count}")
