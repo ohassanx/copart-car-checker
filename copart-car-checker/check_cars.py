@@ -2,9 +2,8 @@
 """
 Copart Car Checker
 Monitors Copart UK for new car listings matching specific criteria:
-- Category: U (Undamaged/Unrecorded)
+- Has V5 document (NOT Category A or B)
 - Year: 2020-2027
-- Has V5 document
 - Damage: Minor or None
 - Transmission: Automatic
 - Mileage: 0-80,000 miles
@@ -98,11 +97,11 @@ def save_seen_cars(car_ids: Set[str]):
 
 def fetch_copart_cars() -> Dict:
     """
-    Fetch current Category U car listings from Copart
+    Fetch current car listings from Copart
 
-    Uses the actual Copart public vehicleFinder API endpoint
+    Uses the actual Copart public lots search-results API endpoint
     """
-    api_url = "https://www.copart.co.uk/public/vehicleFinder/search"
+    api_url = "https://www.copart.co.uk/public/lots/search-results"
 
     headers = {
         "Host": "www.copart.co.uk",
@@ -110,48 +109,50 @@ def fetch_copart_cars() -> Dict:
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-GB,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Content-Type": "application/json",
         "X-Requested-With": "XMLHttpRequest",
         "Connection": "keep-alive",
         "Referer": "https://www.copart.co.uk/lotSearchResults",
         "Cache-Control": "max-age=0"
     }
 
-    # Build search payload in DataTables format
-    # Filter for Category U, Year 2020-2027, Has V5, Automatic, Minor/No damage, 0-80k miles
-    misc_filter = "#TITL:sale_title_type:U #LotYear:[2020 TO 2027] #V5:v5_document_number:* #TMTP:transmission_type:Automatic (#PRID:damage_type_code:DAMAGECODE_MN OR #PRID:damage_type_code:DAMAGECODE_NO) #ODM:odometer_reading:[0 TO 80000]"
-
+    # Build search payload - exact format from Copart
     payload = {
-        "draw": "1",
-        "start": "0",
-        "length": "100",  # Get up to 100 results
-        "page": "1",
-        "size": "100",
-        "query": "*",
-        "sort": "auction_date_type desc,auction_date_utc asc",
+        "query": ["*"],
         "filter": {
-            "MISC": misc_filter
-        }
+            "YEAR": ["lot_year:[2020 TO 2027]"],
+            "PRID": [
+                "damage_type_code:DAMAGECODE_MN",
+                "damage_type_code:DAMAGECODE_NO"
+            ],
+            "TMTP": ['transmission_type:"Automatic"'],
+            "V5": ["v5_document_number:* AND -sale_title_type:B AND -sale_title_type:A"],
+            "ODM": ["odometer_reading_received:[0 TO 80000]"]
+        },
+        "sort": [
+            "lot_year desc",  # Sort by year (newest first)
+            "auction_date_utc asc"
+        ],
+        "page": 0,
+        "size": 100,  # Get up to 100 results
+        "start": 0,
+        "watchListOnly": False,
+        "freeFormSearch": False,
+        "hideImages": False,
+        "defaultSort": True,
+        "specificRowProvided": False,
+        "displayName": "",
+        "searchName": "",
+        "backUrl": "",
+        "includeTagByField": {},
+        "rawParams": {}
     }
 
     try:
         print(f"Attempting to fetch from Copart UK API...")
         print(f"URL: {api_url}")
 
-        # Convert payload to form-urlencoded format
-        import urllib.parse
-        form_data = {
-            "draw": payload["draw"],
-            "start": payload["start"],
-            "length": payload["length"],
-            "page": payload["page"],
-            "size": payload["size"],
-            "query": payload["query"],
-            "sort": payload["sort"],
-            "filter[MISC]": misc_filter
-        }
-
-        response = requests.post(api_url, data=form_data, headers=headers, timeout=20)
+        response = requests.post(api_url, json=payload, headers=headers, timeout=20)
 
         print(f"Status: {response.status_code}")
 
@@ -168,67 +169,156 @@ def fetch_copart_cars() -> Dict:
             except json.JSONDecodeError:
                 print(f"Response is not valid JSON")
                 print(f"Response preview: {response.text[:500]}")
-                return {"cars": [], "total": 0, "error": "Invalid JSON response"}
+                return {"data": {"results": {"content": [], "totalElements": 0}}, "error": "Invalid JSON response"}
         else:
             print(f"API request failed with status {response.status_code}")
             print(f"Response preview: {response.text[:500]}")
-            return {"cars": [], "total": 0, "error": f"HTTP {response.status_code}"}
+            return {"data": {"results": {"content": [], "totalElements": 0}}, "error": f"HTTP {response.status_code}"}
 
     except Exception as e:
         print(f"Error fetching from Copart: {e}")
         import traceback
         traceback.print_exc()
-        return {"cars": [], "total": 0, "error": str(e)}
+        return {"data": {"results": {"content": [], "totalElements": 0}}, "error": str(e)}
 
 
-def extract_car_ids(data: Dict) -> Set[str]:
-    """Extract car/lot IDs from Copart response"""
-    car_ids = set()
+def extract_cars(data: Dict) -> Dict[str, Dict]:
+    """Extract car details from Copart response
 
-    # Handle Copart vehicleFinder API response structure
+    Returns a dict mapping lot_id -> car_details
+    """
+    cars = {}
+
+    # Handle Copart lots/search-results API response structure
     if "data" in data and "results" in data["data"]:
         results_data = data["data"]["results"]
 
         # Check if it has content list
         if "content" in results_data:
             for lot in results_data["content"]:
-                # Use lotNumberStr or ln as the lot ID
-                lot_id = str(lot.get("lotNumberStr", lot.get("ln", "")))
+                # Use ln (lot number) as the lot ID
+                lot_id = str(lot.get("ln", ""))
                 if lot_id:
-                    car_ids.add(lot_id)
-    # Fallback: Try different response structures
-    elif "lots" in data:
-        for lot in data["lots"]:
-            car_ids.add(str(lot.get("lotNumberStr", lot.get("ln", ""))))
-    elif "results" in data:
-        for result in data["results"]:
-            car_ids.add(str(result.get("lotNumber", result.get("id", ""))))
-    elif "cars" in data:
-        for car in data["cars"]:
-            car_ids.add(str(car.get("id", car.get("lot_id", ""))))
+                    cars[lot_id] = {
+                        "lot_id": lot_id,
+                        "lot_url": lot.get("ldu", ""),  # Lot detail URL slug
+                        "year": lot.get("lcy"),  # Lot year
+                        "make": lot.get("mkn"),  # Make name
+                        "model": lot.get("lm"),  # Lot model
+                        "description": lot.get("ld"),  # Lot description
+                        "damage": lot.get("dd"),  # Damage description
+                        "odometer": lot.get("orr"),  # Odometer reading
+                        "transmission": lot.get("tmtp"),  # Transmission type
+                        "engine": lot.get("egn"),  # Engine
+                        "fuel_type": lot.get("ft"),  # Fuel type
+                        "sale_title": lot.get("ts"),  # Title status
+                        "current_bid": lot.get("hb"),  # High bid
+                        "auction_date": lot.get("ad"),  # Auction date
+                        "location": lot.get("yn"),  # Yard name
+                    }
 
-    return {cid for cid in car_ids if cid}  # Remove empty strings
+    return cars
 
 
-def format_car_notification(new_cars: Set[str], total_count: int) -> str:
-    """Format notification message for new cars"""
-    if len(new_cars) == 1:
-        msg = f"🚗 New Copart Alert!\n\n1 new car matching your criteria on Copart UK.\n"
+def extract_car_ids(data: Dict) -> Set[str]:
+    """Extract car/lot IDs from Copart response"""
+    cars = extract_cars(data)
+    return set(cars.keys())
+
+
+def format_car_notification(new_car_ids: Set[str], all_cars: Dict[str, Dict], total_count: int) -> List[str]:
+    """Format notification message for new cars
+
+    Returns a list of messages (split if too long for Telegram's 4096 char limit)
+    """
+    messages = []
+
+    if len(new_car_ids) == 0:
+        return messages
+
+    # Header
+    header = f"🚗 New Copart Alert!\n\n{len(new_car_ids)} new car(s) matching your criteria:\n"
+    header += f"\n{'='*40}\n"
+
+    current_msg = header
+    car_count = 0
+
+    # Sort car IDs by year (newest first), then by lot_id
+    def get_sort_key(lot_id):
+        car = all_cars.get(lot_id, {})
+        year = car.get("year", 0) or 0  # Handle None
+        return (-year, lot_id)  # Negative year for descending order
+
+    for lot_id in sorted(new_car_ids, key=get_sort_key):
+        car = all_cars.get(lot_id, {})
+
+        # Format car details
+        car_info = f"\n"
+
+        # Main details
+        year = car.get("year", "N/A")
+        make = car.get("make", "Unknown")
+        model = car.get("model", "Unknown")
+        car_info += f"📍 {year} {make} {model}\n"
+
+        # Additional details
+        damage = car.get("damage", "N/A")
+        if damage:
+            car_info += f"   Damage: {damage}\n"
+
+        odometer = car.get("odometer")
+        if odometer:
+            car_info += f"   Mileage: {odometer:,} miles\n"
+
+        transmission = car.get("transmission", "")
+        if transmission:
+            car_info += f"   Transmission: {transmission}\n"
+
+        current_bid = car.get("current_bid")
+        if current_bid:
+            car_info += f"   Current Bid: £{current_bid:,}\n"
+
+        location = car.get("location", "")
+        if location:
+            car_info += f"   Location: {location}\n"
+
+        # Direct link using proper Copart URL format: /lot/{ln}/{ldu}
+        lot_url = car.get("lot_url", "")
+        if lot_url:
+            car_info += f"   🔗 https://www.copart.co.uk/lot/{lot_id}/{lot_url}\n"
+        else:
+            # Fallback to simple lot number URL
+            car_info += f"   🔗 https://www.copart.co.uk/lot/{lot_id}\n"
+        car_info += f"\n{'='*40}\n"
+
+        # Check if adding this car would exceed Telegram's limit (4096 chars)
+        if len(current_msg + car_info) > 4000:
+            # Save current message and start a new one
+            messages.append(current_msg)
+            current_msg = f"🚗 Continued ({car_count + 1}/{len(new_car_ids)})...\n\n"
+            current_msg += car_info
+        else:
+            current_msg += car_info
+
+        car_count += 1
+
+    # Add footer to last message
+    footer = f"\nTotal listings: {total_count}\n"
+    footer += f"\n📋 Search Criteria:\n"
+    footer += f"• Has V5 (NOT Cat A or B)\n"
+    footer += f"• Year: 2020-2027\n"
+    footer += f"• Transmission: Automatic\n"
+    footer += f"• Mileage: 0-80,000 miles\n"
+    footer += f"• Damage: Minor or None\n"
+
+    if len(current_msg + footer) > 4000:
+        messages.append(current_msg)
+        messages.append(footer)
     else:
-        msg = f"🚗 New Copart Alert!\n\n{len(new_cars)} new cars matching your criteria on Copart UK.\n"
+        current_msg += footer
+        messages.append(current_msg)
 
-    msg += f"\nTotal listings: {total_count}"
-    msg += f"\n\nCriteria:"
-    msg += f"\n• Category: U (Undamaged/Unrecorded)"
-    msg += f"\n• Year: 2020-2027"
-    msg += f"\n• Transmission: Automatic"
-    msg += f"\n• Mileage: 0-80,000 miles"
-    msg += f"\n• Damage: Minor or None"
-    msg += f"\n• Has V5 document"
-    msg += f"\n• All makes & models"
-    msg += f"\n\nView: {SEARCH_URL}"
-
-    return msg
+    return messages
 
 
 def main():
@@ -237,13 +327,14 @@ def main():
     print("COPART CAR CHECKER (CATEGORY U)")
     print("="*60)
 
-    # Load previously seen cars
+    # Load previously seen cars (for duplicate prevention)
     seen_cars = load_seen_cars()
     print(f"Previously seen cars: {len(seen_cars)}")
 
-    # Fetch current listings
+    # Fetch current listings from Copart API
     data = fetch_copart_cars()
-    current_cars = extract_car_ids(data)
+    all_cars = extract_cars(data)
+    current_cars = set(all_cars.keys())
 
     # Get total count from response
     total_count = 0
@@ -255,23 +346,27 @@ def main():
     print(f"Current cars found: {len(current_cars)}")
     print(f"Total count: {total_count}")
 
-    # Detect new cars
+    # Detect NEW cars only (current cars that we haven't seen before)
+    # This prevents sending duplicate notifications
     new_cars = current_cars - seen_cars
 
     if new_cars:
         print(f"\n🎉 Found {len(new_cars)} new car(s)!")
         print(f"New car IDs: {sorted(new_cars)}")
 
-        # Send notification
+        # Send notification(s) ONLY for new cars (sorted by year, newest first)
         try:
-            message = format_car_notification(new_cars, total_count)
-            notify(message)
+            messages = format_car_notification(new_cars, all_cars, total_count)
+            for i, message in enumerate(messages):
+                print(f"\nSending notification {i+1}/{len(messages)}...")
+                notify(message)
         except Exception as e:
             print(f"Failed to send notification: {e}")
     else:
-        print("\nℹ No new cars found")
+        print("\nℹ No new cars found (no duplicates sent)")
 
-    # Update seen cars
+    # Save all current cars to state file
+    # Next time we run, these will be "seen" and won't trigger notifications
     if current_cars:
         save_seen_cars(current_cars)
         print(f"\n✓ State updated with {len(current_cars)} car(s)")
